@@ -29,7 +29,7 @@ void appMain(void)
     // 2) Инициализация железа (SPI/UART/READY)
     ESP_LOGI(TAG, "Initializing plotter hardware...");
     plotter_init();
-    plotter_startfr_all_tasks();  // UART rx loop, control/heartbeat, keypad
+    plotter_start_all_tasks();  // UART rx loop, control/heartbeat, keypad
 
     vTaskDelay(pdMS_TO_TICKS(500)); // stab
 
@@ -53,9 +53,9 @@ void appMain(void)
         plotter_get_state(&ps);
 
         ESP_LOGI(TAG,
-                 "alive: %" PRIu32 "s, RB=%zu/%u, Plotter: conn=%d cal=%d home=%d X=%" PRId32 " Y=%" PRId32,
+                 "alive: %" PRIu32 "s, RB=%u/%u, Plotter: conn=%d cal=%d home=%d X=%" PRId32 " Y=%" PRId32,
                  uptime_s,
-                 rb_used(&g_rb), (unsigned)RB_SIZE_BYTES,
+                 (unsigned)rb_used(&g_rb), (unsigned)RB_SIZE_BYTES,
                  ps.is_connected, ps.is_calibrated, ps.is_homed,
                  ps.x_pos, ps.y_pos);
     }
