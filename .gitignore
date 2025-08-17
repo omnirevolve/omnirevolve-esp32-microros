@@ -9,3 +9,5 @@
 **/*.elf
 **/*.map
 **/*.log
+
+.vscode
