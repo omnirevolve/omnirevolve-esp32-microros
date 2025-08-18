@@ -23,37 +23,19 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-// интеграция со слоями проекта
-#include "ring_buffer.h"
 #include "esp32_to_stm32.h"
-#include "spi_feeder.h"
 
-// ================== Константы протокола/алгоритма ==================
-#ifndef RX_PACKET_BYTES
-#define RX_PACKET_BYTES              480u     // размер «полезной» части пакета от паблишера
-#endif
+// ===================== DEFINES =======================
+#define PACKETS_NUMBER_FOR_FIRST_REQUEST 5
+#define RX_PACKET_BYTES 480u
 
-// целевая «почти-полная» заполненность кольцевого буфера
-#ifndef SLACK_BYTES
-#define SLACK_BYTES                  RX_PACKET_BYTES   // небольшой зазор под очередной пакет
-#endif
+#define RCCHECK(fn) do{ rcl_ret_t rc__ = (fn); if (rc__ != RCL_RET_OK){ \
+    ESP_LOGE(TAG, "RCL err %d at %s:%d", (int)rc__, __FILE__, __LINE__); return; } }while(0)
 
-#ifndef ASK_MAX_PER_SHOT
-#define ASK_MAX_PER_SHOT             40u      // разовый «дозаряд» буфера
-#endif
-
-// вместимость приёмного ROS-сообщения (для prealloc в executor)
-#ifndef RX_MSG_CAP_BYTES
-  #if SEQ_ID_ENABLED
-    #define RX_MSG_CAP_BYTES (RX_PACKET_BYTES + 1)
-  #else
-    #define RX_MSG_CAP_BYTES (RX_PACKET_BYTES)
-  #endif
-#endif
-// ==================================================================
-
+// ===================== LOG TAG =======================
 static const char *TAG = "microros_bridge";
 
+// ===================== PROTOTYPES =======================
 // micro-ROS объекты
 static rcl_allocator_t      allocator;
 static rclc_support_t       support;
@@ -70,122 +52,144 @@ static std_msgs__msg__UInt8MultiArray s_msg_stream;
 static std_msgs__msg__Empty           s_msg_empty;
 static std_msgs__msg__UInt8           s_msg_need;
 
-// состояние
-static rb_t *s_rb = NULL;
-static microros_bridge_stats_t s_stats = {0};
-
 static volatile bool     s_draw_active       = false;
 static volatile bool     s_finish_requested  = false;
 static volatile bool     s_finish_cmd_sent   = false;
 
 static volatile uint8_t  s_outstanding_pkts  = 0; // сколько запросили, но ещё не пришло
 
-// ===== утилиты =====
-#define RCCHECK(fn) do{ rcl_ret_t rc__ = (fn); if (rc__ != RCL_RET_OK){ \
-    ESP_LOGE(TAG, "RCL err %d at %s:%d", (int)rc__, __FILE__, __LINE__); return; } }while(0)
+static uint8_t data_buf[2][SPI_CHUNK_SIZE];
+static size_t active_buf_len = 0;
+static uint8_t active_buf_index = 0;
+static uint8_t *output_buf = NULL;
+static size_t output_buf_size = 0;
+static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
+static TaskHandle_t sender_task_handle = NULL;
 
-static inline uint8_t clamp_u8(size_t v){ return (v > 255) ? 255u : (uint8_t)v; }
-
-// сколько пакетов нужно добрать, чтобы держать буфер ≈ полный (RB_SIZE_BYTES - SLACK_BYTES)
-static uint8_t pkts_needed_to_target(size_t used_bytes, uint8_t outstanding_pkts)
-{
-    const size_t target = (RB_SIZE_BYTES > SLACK_BYTES) ? (RB_SIZE_BYTES - SLACK_BYTES) : RB_SIZE_BYTES;
-    size_t have = used_bytes + (size_t)outstanding_pkts * (size_t)RX_PACKET_BYTES;
-    if (have >= target) return 0;
-
-    size_t deficit = target - have;
-    size_t need    = (deficit + RX_PACKET_BYTES - 1) / RX_PACKET_BYTES; // ceil
-    if (need > ASK_MAX_PER_SHOT) need = ASK_MAX_PER_SHOT;
-    return clamp_u8(need);
-}
+// ===================== NEED PACKETS =======================
 
 static void publish_need_packets(uint8_t n){
-    if (n == 0) return;
     s_msg_need.data = n;
-    rcl_ret_t rc = rcl_publish(&pub_need, &s_msg_need, NULL);
-    if (rc == RCL_RET_OK){
-        s_outstanding_pkts = (uint8_t)(s_outstanding_pkts + n);
-        ESP_LOGI(TAG, "need_packets: %u (outstanding=%u, rb_used=%u/%u)",
-                 n, s_outstanding_pkts, (unsigned)rb_used(s_rb), (unsigned)RB_SIZE_BYTES);
-    } else {
-        ESP_LOGW(TAG, "need_packets publish failed rc=%d", (int)rc);
+    for (;;)
+    {
+        rcl_ret_t rc = rcl_publish(&pub_need, &s_msg_need, NULL);
+        if (rc == RCL_RET_OK){
+            s_outstanding_pkts = (uint8_t)(s_outstanding_pkts + n);
+            ESP_LOGI(TAG, "SENDING: need_packets: %u", n);
+            break;
+        } else {
+            ESP_LOGW(TAG, "need_packets publish failed rc=%d", (int)rc);
+        }
+        ESP_LOGW(TAG, ">> Waiting for 20ms and repeat again");
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
-// ===== callbacks =====
+// ===================== PACKETS RECEIVING CALLBACK =======================
 static void sub_stream_cb(const void * msgin)
 {
     const std_msgs__msg__UInt8MultiArray *m = (const std_msgs__msg__UInt8MultiArray*)msgin;
     const uint8_t *data = m->data.data;
     size_t len = m->data.size;
 
-#if SEQ_ID_ENABLED
-    if (len < 1){
-        s_stats.drops_total++;
-        return;
-    }
-    uint8_t seq = data[0];
-    if (s_stats.last_seq >= 0){
-        uint8_t expect = ((uint8_t)s_stats.last_seq + 1u) & 0xFF;
-        if (seq != expect){
-            s_stats.seq_missed++;
-            ESP_LOGW(TAG, "seq miss: expect=%u got=%u", expect, seq);
-        }
-    }
-    s_stats.last_seq = seq;
-    data += 1;
-    len  -= 1;
-#endif
-
     if (len == 0){
-        s_stats.drops_total++;
+        ESP_LOGW(TAG, ">> Recieved len == 0");
         return;
     }
+    
     if (len != RX_PACKET_BYTES){
-        ESP_LOGW(TAG, "unexpected payload len=%u (expected %u)",
+        ESP_LOGW(TAG, ">> Unexpected payload len=%u (expected %u)",
                  (unsigned)len, (unsigned)RX_PACKET_BYTES);
     }
 
-    size_t w = rb_write_all_or_drop(s_rb, data, len);
-    if (w == 0){
-        s_stats.drops_total++;
-        ESP_LOGW(TAG, "RB full: drop %u", (unsigned)len);
+    if (!s_draw_active) {
+        ESP_LOGW(TAG, "Received data from plotter data publisher when draw_active == FALSE");
         return;
     }
 
-    if (s_outstanding_pkts > 0) s_outstanding_pkts--;
+    if (s_draw_active && s_finish_requested && output_buf != NULL) {
+        ESP_LOGW(TAG, "Check logic"); // maybe wrong logic
+        return;
+    }
 
-    s_stats.pkts_in++;
-    s_stats.bytes_in += (uint32_t)w;
+    // check if we need write all the data in current buf:
+    if (len + active_buf_len >= SPI_CHUNK_SIZE) {
+        size_t extra_len = len + active_buf_len - SPI_CHUNK_SIZE;
+        memcpy(data_buf[active_buf_index] + active_buf_len, data, len - extra_len);
+        if (output_buf != NULL) {
+            ESP_LOGW(TAG, ">> Has issue with buffer reader");
+        }
+        portENTER_CRITICAL(&s_mux);
+        output_buf = data_buf[active_buf_index]; // set fulfilled buffer as output (to send to plotter)
+        output_buf_size = SPI_CHUNK_SIZE;
+        portEXIT_CRITICAL(&s_mux);
+        xTaskNotifyGive(sender_task_handle);
+        active_buf_index = !active_buf_index; // set another buf as active
+        if (extra_len != 0) { // copy the rest of data if presented:
+            memcpy(data_buf[active_buf_index], data + len - extra_len, extra_len);
+        }
+        active_buf_len = extra_len;
+        publish_need_packets((SPI_CHUNK_SIZE - extra_len)/RX_PACKET_BYTES);
+    }
+    else {
+        memcpy(data_buf[active_buf_index] + active_buf_len, data, len);
+    }
+    if (s_draw_active && s_finish_requested) {
+        portENTER_CRITICAL(&s_mux);
+        output_buf = data_buf[active_buf_index]; // set what we have as output (to send to plotter)
+        output_buf_size = active_buf_len;
+        portEXIT_CRITICAL(&s_mux);
+    }
 }
+
+// ===================== DATA SENDER TO PLOTTER =======================
+static void send_data_to_plotter_task(void *arg)
+{
+    (void)arg;
+    
+    ulTaskNotifyTake(pdTRUE, 0);
+ 
+    for(;;){
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (!s_draw_active) {
+            ESP_LOGW(TAG, ">> Sender was activated when there is no active drawing");
+            continue;
+        }
+        
+        // if we were waked up, then wait plotter ready signal:
+        for(;;){
+            if (plotter_is_ready_to_receive_draw_stream_data()) {
+                if (output_buf_size < SPI_CHUNK_SIZE) {
+                    if (!s_finish_requested){
+                        ESP_LOGW(TAG, ">> Wrong logic in the code");
+                    }
+                    else {
+                        ESP_LOGW(TAG, ">> Signal for the last packet of draw stream was received");
+                    }
+                    memset(output_buf + output_buf_size, 0, SPI_CHUNK_SIZE - output_buf_size);
+                    output_buf_size = SPI_CHUNK_SIZE;
+                }
+                plotter_send_draw_stream_data(data_buf, output_buf_size);
+                portENTER_CRITICAL(&s_mux);
+                output_buf = NULL;
+                output_buf_size = 0;
+                portEXIT_CRITICAL(&s_mux);
+            }
+            else {
+                vTaskDelay(pdMS_TO_TICKS(5));
+            }
+        }
+    }   
+}
+
+// ===================== DRAW_START / DRAW_FINISH MESSAGE HANDLERS =======================
 
 static void sub_draw_start_cb(const void * msgin)
 {
     (void)msgin;
-
-    // сброс локального состояния/статистики
-    s_stats               = (microros_bridge_stats_t){0};
-    s_stats.last_seq      = -1;
-    s_outstanding_pkts    = 0;
-    s_finish_requested    = false;
-    s_finish_cmd_sent     = false;
-
-    rb_reset(s_rb);
-
-    // уведомляем STM32 о начале приёма стрима
     plotter_send_cmd(CMD_DRAW_BEGIN, NULL);
     s_draw_active = true;
-
-    // стартовая догрузка — сразу стремимся заполнить RB почти под завязку
-    {
-        size_t used = rb_used(s_rb);
-        size_t free_pkts = rb_free_space(s_rb) / RX_PACKET_BYTES;
-        uint8_t ask = pkts_needed_to_target(used, 0);
-        if (ask > free_pkts) ask = clamp_u8(free_pkts);
-        if (ask) publish_need_packets(ask);
-    }
-
-    ESP_LOGI(TAG, "DRAW_START");
+    publish_need_packets(PACKETS_NUMBER_FOR_FIRST_REQUEST);
 }
 
 static void sub_draw_finish_cb(const void * msgin)
@@ -193,62 +197,6 @@ static void sub_draw_finish_cb(const void * msgin)
     (void)msgin;
     s_finish_requested = true;
     ESP_LOGI(TAG, "DRAW_FINISH requested");
-}
-
-// ===== задачи =====
-static void need_request_task(void *arg)
-{
-    (void)arg;
-    for(;;){
-        if (s_draw_active){
-            if (!s_finish_requested){
-                // публикуем ДОБОР только когда пред. запрос уже «закрыт»
-                if (s_outstanding_pkts == 0){
-                    size_t used      = rb_used(s_rb);
-                    size_t free_pkts = rb_free_space(s_rb) / RX_PACKET_BYTES;
-
-                    uint8_t need = pkts_needed_to_target(used, 0);
-                    if (need > free_pkts) need = clamp_u8(free_pkts);
-                    if (need > 0){
-                        publish_need_packets(need);
-                    }
-                }
-            } else {
-                // Завершение: дожать остаток через фидер и отдать команду STM32
-                if (s_outstanding_pkts == 0 && !spi_feeder_is_flushed()){
-                    spi_feeder_request_finish();
-                }
-                if (s_outstanding_pkts == 0 && spi_feeder_is_flushed() && !s_finish_cmd_sent){
-                    plotter_send_cmd(CMD_DRAW_FINISH_WHEN_EMPTY, NULL);
-                    s_finish_cmd_sent = true;
-                    s_draw_active     = false;
-                    ESP_LOGI(TAG, "DRAW_FINISH sent to STM32 (after flush)");
-                }
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(5));
-    }
-}
-
-static void log_task(void *arg)
-{
-    (void)arg;
-    for(;;){
-        ESP_LOGI(TAG,
-                 "in: pkts=%" PRIu32 " bytes=%" PRIu32 " drops=%" PRIu32
-                 " seqmiss=%" PRIu32 " rb_used=%u/%u outstanding=%u active=%d finish=%d flushed=%d",
-                 s_stats.pkts_in,
-                 s_stats.bytes_in,
-                 s_stats.drops_total,
-                 s_stats.seq_missed,
-                 (unsigned)rb_used(s_rb),
-                 (unsigned)RB_SIZE_BYTES,
-                 (unsigned)s_outstanding_pkts,
-                 (int)s_draw_active,
-                 (int)s_finish_requested,
-                 (int)spi_feeder_is_flushed());
-        vTaskDelay(pdMS_TO_TICKS(LOG_PERIOD_MS));
-    }
 }
 
 static void executor_task(void *arg)
@@ -260,12 +208,10 @@ static void executor_task(void *arg)
     }
 }
 
-// ===== инициализация micro-ROS =====
+// ===================== MICRO-ROS INITIALIZING =======================
 static void microros_init_task(void *arg)
 {
-    rb_t *rb = (rb_t *)arg;
-    s_rb = rb;
-
+    (void)arg;
     vTaskDelay(pdMS_TO_TICKS(1000)); // небольшой стартовый лаг сети
 
     allocator = rcl_get_default_allocator();
@@ -291,15 +237,15 @@ static void microros_init_task(void *arg)
     RCCHECK(rclc_support_init_with_options(&support, 0, NULL, &init_options, &allocator));
     RCCHECK(rclc_node_init_default(&node, "esp32_plotter_node", "", &support));
 
-    // Publisher: need_packets — ЯВНО RELIABLE
+    // Publisher: need_packets RELIABLE
     RCCHECK(rclc_publisher_init(
         &pub_need, &node,
         ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8),
         "/plotter/cmd/need_packets",
         &rmw_qos_profile_default));  // reliable
 
-    // Subscriber: stream (BestEffort, KeepLast(1))
-    RCCHECK(rclc_subscription_init_best_effort(
+    // Subscriber: stream RELIABLE
+    RCCHECK(rclc_subscription_init(
         &sub_stream, &node,
         ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8MultiArray),
         "/plotter/byte_stream"));
@@ -315,9 +261,8 @@ static void microros_init_task(void *arg)
         ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Empty),
         "/plotter/cmd/draw_finish"));
 
-    // Приёмные сообщения
     std_msgs__msg__UInt8MultiArray__init(&s_msg_stream);
-    bool ok = rosidl_runtime_c__uint8__Sequence__init(&s_msg_stream.data, RX_MSG_CAP_BYTES);
+    bool ok = rosidl_runtime_c__uint8__Sequence__init(&s_msg_stream.data, RX_PACKET_BYTES);
     if (!ok){
         ESP_LOGE(TAG, "Sequence init failed");
         return;
@@ -331,23 +276,14 @@ static void microros_init_task(void *arg)
     RCCHECK(rclc_executor_add_subscription(&executor, &sub_draw_start, &s_msg_empty,   &sub_draw_start_cb, ON_NEW_DATA));
     RCCHECK(rclc_executor_add_subscription(&executor, &sub_draw_finish,&s_msg_empty,   &sub_draw_finish_cb,ON_NEW_DATA));
 
-    xTaskCreatePinnedToCore(executor_task,    "mr_executor",  9216, rb, 6, NULL, 0);
-    xTaskCreatePinnedToCore(need_request_task,"mr_need_req",  6144, rb, 5, NULL, 0);
-    xTaskCreatePinnedToCore(log_task,         "mr_log",       4096, rb, 3, NULL, 0);
+    xTaskCreatePinnedToCore(executor_task,    "mr_executor",  9216, NULL, 6, NULL, 0);
+    xTaskCreatePinnedToCore(send_data_to_plotter_task, "mr_sender", 2048, NULL, 5, &sender_task_handle, 0);
 
-    ESP_LOGI(TAG, "initialized (RB=%uB, pkt=%uB, slack=%uB, seq_id=%d)",
-             (unsigned)RB_SIZE_BYTES, (unsigned)RX_PACKET_BYTES, (unsigned)SLACK_BYTES, (int)SEQ_ID_ENABLED);
     vTaskDelete(NULL);
 }
 
 // ===== API =====
-void microros_bridge_init(rb_t *rb)
+void microros_bridge_init()
 {
-    s_stats.last_seq = -1;
-    xTaskCreatePinnedToCore(microros_init_task, "mr_init", 16384, rb, 5, NULL, 0);
-}
-
-const microros_bridge_stats_t* microros_bridge_stats(void)
-{
-    return &s_stats;
+    xTaskCreatePinnedToCore(microros_init_task, "mr_init", 16384, NULL, 5, NULL, 0);
 }
