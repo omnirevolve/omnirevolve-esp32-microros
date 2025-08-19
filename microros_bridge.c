@@ -22,6 +22,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #include "esp32_to_stm32.h"
 
@@ -54,18 +55,33 @@ static std_msgs__msg__UInt8           s_msg_need;
 
 static volatile bool     s_draw_active       = false;
 static volatile bool     s_finish_requested  = false;
-static volatile bool     s_finish_cmd_sent   = false;
-
-static volatile uint8_t  s_outstanding_pkts  = 0; // сколько запросили, но ещё не пришло
 
 static uint8_t data_buf[2][SPI_CHUNK_SIZE];
-static size_t active_buf_len = 0;
-static uint8_t active_buf_index = 0;
-static uint8_t *output_buf = NULL;
-static size_t output_buf_size = 0;
-static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint8_t data_tail[RX_PACKET_BYTES];
+static volatile uint8_t data_buf_full[2] = {0, 0};
+static volatile uint8_t data_requested_for_buf[2] = {0, 0};
 static TaskHandle_t sender_task_handle = NULL;
 
+// microros_bridge.c (где-нибудь рядом с глобальными переменными)
+static SemaphoreHandle_t s_out_mutex = NULL;
+
+static void init_mutex(void)
+{
+#if (configUSE_MUTEXES == 1)
+    s_out_mutex = xSemaphoreCreateMutex();            // динамический мьютекс
+    configASSERT(s_out_mutex != NULL);
+#else
+    s_out_mutex = xSemaphoreCreateBinary();
+    configASSERT(s_out_mutex != NULL);
+    xSemaphoreGive(s_out_mutex);                      // сделать «отпущенным»
+#warning "configUSE_MUTEXES==0: используем бинарный семафор вместо мьютекса"
+#endif
+}
+
+#define LOCK_DATA_REQUEST_FLAG_CHANGING()    xSemaphoreTake(s_out_mutex, portMAX_DELAY)
+#define UNLOCK_DATA_REQUEST_FLAG_CHANGING()  xSemaphoreGive(s_out_mutex)
+
+static uint8_t pending_buf_index = 0xFF;
 // ===================== NEED PACKETS =======================
 
 static void publish_need_packets(uint8_t n){
@@ -74,7 +90,6 @@ static void publish_need_packets(uint8_t n){
     {
         rcl_ret_t rc = rcl_publish(&pub_need, &s_msg_need, NULL);
         if (rc == RCL_RET_OK){
-            s_outstanding_pkts = (uint8_t)(s_outstanding_pkts + n);
             ESP_LOGI(TAG, "SENDING: need_packets: %u", n);
             break;
         } else {
@@ -85,21 +100,38 @@ static void publish_need_packets(uint8_t n){
     }
 }
 
+static uint32_t stored_data_len = 0;
+static uint32_t out_of_current_buf_len = 0;
+static uint8_t next_filling_buf_index = 0;
+static uint32_t tail_data_len = 0;
+
+static void reset_sub_stream_cb_private_variables() {
+    stored_data_len = 0;
+    out_of_current_buf_len = 0;
+    next_filling_buf_index = 0;
+    tail_data_len = 0;
+}
+
+static void reset_plotter_streaming_variables() {
+    data_buf_full[0] = 0;
+    data_buf_full[1] = 0;
+}
 // ===================== PACKETS RECEIVING CALLBACK =======================
 static void sub_stream_cb(const void * msgin)
 {
+    //ESP_LOGI(TAG, ">> sub_stream_cb entered");
     const std_msgs__msg__UInt8MultiArray *m = (const std_msgs__msg__UInt8MultiArray*)msgin;
-    const uint8_t *data = m->data.data;
-    size_t len = m->data.size;
+    const uint8_t *incoming_data = m->data.data;
+    size_t incoming_data_len = m->data.size;
 
-    if (len == 0){
+    if (incoming_data_len == 0){
         ESP_LOGW(TAG, ">> Recieved len == 0");
         return;
     }
     
-    if (len != RX_PACKET_BYTES){
+    if (incoming_data_len != RX_PACKET_BYTES){
         ESP_LOGW(TAG, ">> Unexpected payload len=%u (expected %u)",
-                 (unsigned)len, (unsigned)RX_PACKET_BYTES);
+                 (unsigned)incoming_data_len, (unsigned)RX_PACKET_BYTES);
     }
 
     if (!s_draw_active) {
@@ -107,78 +139,146 @@ static void sub_stream_cb(const void * msgin)
         return;
     }
 
-    if (s_draw_active && s_finish_requested && output_buf != NULL) {
-        ESP_LOGW(TAG, "Check logic"); // maybe wrong logic
+    // if (s_draw_active && s_finish_requested ) {
+    //     ESP_LOGW(TAG, "Check logic: received data when the "); // maybe wrong logic
+    //     return;
+    // }
+
+// NOTIFY CMD: xTaskNotifyGive(sender_task_handle);
+
+    if (data_buf_full[next_filling_buf_index]) { // this receiver should be called only if we have empty buffer; otherwise, this is wrong pipeline:
+        ESP_LOGE("ROS2 packets receiver", "Wrong data pipeline, can't continue: receiving terminated, data dropped");
         return;
     }
 
+    // check if we have tail in the tail buf:
+    if (tail_data_len != 0) { // copy tail to currently filling buf:
+       memcpy(data_buf, data_tail, tail_data_len);
+       tail_data_len = 0;
+    }
+
     // check if we need write all the data in current buf:
-    if (len + active_buf_len >= SPI_CHUNK_SIZE) {
-        size_t extra_len = len + active_buf_len - SPI_CHUNK_SIZE;
-        memcpy(data_buf[active_buf_index] + active_buf_len, data, len - extra_len);
-        if (output_buf != NULL) {
-            ESP_LOGW(TAG, ">> Has issue with buffer reader");
+    if ((stored_data_len + incoming_data_len) >= SPI_CHUNK_SIZE) {
+        out_of_current_buf_len = stored_data_len + incoming_data_len - SPI_CHUNK_SIZE;
+        memcpy(data_buf[next_filling_buf_index] + stored_data_len, incoming_data, incoming_data_len - out_of_current_buf_len);
+        data_requested_for_buf[next_filling_buf_index] = 0; // it should be safe because we can't sending and filling the buf simultaneously
+        data_buf_full[next_filling_buf_index] = 1;
+        // identify if we have free transfer buffer or we have to store in tail buf:
+        next_filling_buf_index = !next_filling_buf_index; // switch active buffer (should be normal flow)
+        uint8_t store_in_tail_buf = data_buf_full[next_filling_buf_index]; // if the next normal buf is still full, we have to store data tail in tail buf
+        uint8_t *target_buf_for_data_tail = store_in_tail_buf ? data_tail : data_buf[next_filling_buf_index];
+        memcpy(target_buf_for_data_tail, incoming_data + incoming_data_len - out_of_current_buf_len, out_of_current_buf_len);
+
+        if (store_in_tail_buf) {
+            tail_data_len = out_of_current_buf_len;
+        } else {
+            stored_data_len = out_of_current_buf_len;
         }
-        portENTER_CRITICAL(&s_mux);
-        output_buf = data_buf[active_buf_index]; // set fulfilled buffer as output (to send to plotter)
-        output_buf_size = SPI_CHUNK_SIZE;
-        portEXIT_CRITICAL(&s_mux);
-        xTaskNotifyGive(sender_task_handle);
-        active_buf_index = !active_buf_index; // set another buf as active
-        if (extra_len != 0) { // copy the rest of data if presented:
-            memcpy(data_buf[active_buf_index], data + len - extra_len, extra_len);
+        
+        if (!store_in_tail_buf) {
+            uint8_t send_request_for_more_data = 0;
+            LOCK_DATA_REQUEST_FLAG_CHANGING();
+            if (!data_requested_for_buf[next_filling_buf_index]) {
+                send_request_for_more_data = 1;
+                data_requested_for_buf[next_filling_buf_index] = 1;
+            }
+            UNLOCK_DATA_REQUEST_FLAG_CHANGING();
+            if (send_request_for_more_data) {
+                publish_need_packets((SPI_CHUNK_SIZE - out_of_current_buf_len)/RX_PACKET_BYTES + (out_of_current_buf_len ? 1 : 0));
+            }
         }
-        active_buf_len = extra_len;
-        publish_need_packets((SPI_CHUNK_SIZE - extra_len)/RX_PACKET_BYTES);
     }
     else {
-        memcpy(data_buf[active_buf_index] + active_buf_len, data, len);
+        memcpy(data_buf[next_filling_buf_index] + stored_data_len, incoming_data, incoming_data_len);
+        stored_data_len += incoming_data_len;
     }
+    
     if (s_draw_active && s_finish_requested) {
-        portENTER_CRITICAL(&s_mux);
-        output_buf = data_buf[active_buf_index]; // set what we have as output (to send to plotter)
-        output_buf_size = active_buf_len;
-        portEXIT_CRITICAL(&s_mux);
+        if (stored_data_len != SPI_CHUNK_SIZE) {
+            memset(data_buf[next_filling_buf_index] + stored_data_len, 0, SPI_CHUNK_SIZE - stored_data_len); // fill with 0 all the data to make the packet eq SPI_CHUNK_SIZE
+        }
+        data_buf_full[next_filling_buf_index] = 1;
+        reset_sub_stream_cb_private_variables();
     }
 }
 
 // ===================== DATA SENDER TO PLOTTER =======================
+static void wait_on_task(uint32_t *ticks_count, uint8_t *tag, uint8_t *info_message) {
+    static const uint8_t tick_wait_delay = 5;
+    static const uint8_t log_after_s = 5;
+    vTaskDelay(pdMS_TO_TICKS(tick_wait_delay));
+    if (++(*ticks_count) > log_after_s * 1000 / tick_wait_delay) {
+        ESP_LOGW(tag, "%s for more than %ds", info_message, log_after_s);
+        *ticks_count = 0;
+    }                
+}
+
 static void send_data_to_plotter_task(void *arg)
 {
+    static uint8_t pipeline_is_broken = 0;
+    static uint8_t SENDER_TAG[] = "Plotter packets sender";
+
+    if (pipeline_is_broken) {
+        vTaskDelay(2000);
+        ESP_LOGE(SENDER_TAG, "Wrong data pipeline, can't continue: sending terminated, data dropped");
+    }
+
+    ESP_LOGI(SENDER_TAG, ">> send_data_to_plotter_task started");
     (void)arg;
     
-    ulTaskNotifyTake(pdTRUE, 0);
- 
+    //ulTaskNotifyTake(pdTRUE, 0);
     for(;;){
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
         if (!s_draw_active) {
-            ESP_LOGW(TAG, ">> Sender was activated when there is no active drawing");
+            ESP_LOGW(SENDER_TAG, ">> Sender was activated when there is no active drawing");
             continue;
         }
-        
-        // if we were waked up, then wait plotter ready signal:
-        for(;;){
-            if (plotter_is_ready_to_receive_draw_stream_data()) {
-                if (output_buf_size < SPI_CHUNK_SIZE) {
-                    if (!s_finish_requested){
-                        ESP_LOGW(TAG, ">> Wrong logic in the code");
-                    }
-                    else {
-                        ESP_LOGW(TAG, ">> Signal for the last packet of draw stream was received");
-                    }
-                    memset(output_buf + output_buf_size, 0, SPI_CHUNK_SIZE - output_buf_size);
-                    output_buf_size = SPI_CHUNK_SIZE;
+
+        uint32_t ticks_count = 0;
+        // TODO: make this loop stoppable:
+        while (!plotter_is_ready_to_receive_draw_stream_data()) { // just wait when plotter ready
+            wait_on_task(ticks_count, SENDER_TAG, "Waiting for plotter ready");
+        }
+       
+        ESP_LOGI(SENDER_TAG, "Plotter ready");
+
+        static uint8_t next_buffer_index = 0;
+
+        ticks_count = 0;
+        // TODO: make this loop stoppable with timeout:
+        while (!data_buf_full[next_buffer_index])) {
+            wait_on_task(ticks_count, SENDER_TAG, "Waiting for fullfilled buffer ");
+            if (s_finish_requested) {
+                reset_plotter_streaming_variables();
+                if (data_buf_full[0] || data_buf_full[1]) { // TODO: check logic when both the buffers are not empty
+                    next_buffer_index = data_buf_full[0] ? 0 : 1;
                 }
-                plotter_send_draw_stream_data(data_buf, output_buf_size);
-                portENTER_CRITICAL(&s_mux);
-                output_buf = NULL;
-                output_buf_size = 0;
-                portEXIT_CRITICAL(&s_mux);
-            }
-            else {
-                vTaskDelay(pdMS_TO_TICKS(5));
             }
         }
+        
+        ESP_LOGI(SENDER_TAG, "Plotter ready & have fullfilled buffer index %u, sending data...", next_buffer_index);
+        plotter_send_draw_stream_data(data_buf[next_buffer_index], SPI_CHUNK_SIZE);
+        if (!s_finish_requested) {
+            uint8_t send_request_for_more_data = 0;
+            LOCK_DATA_REQUEST_FLAG_CHANGING();
+            if (!data_buf[next_buffer_index]) {
+                send_request_for_more_data = 1;
+                data_requested_for_buf[next_filling_buf_index] = 1;
+            }
+            UNLOCK_DATA_REQUEST_FLAG_CHANGING();
+            if (send_request_for_more_data){
+                publish_need_packets((SPI_CHUNK_SIZE/RX_PACKET_BYTES) + ((SPI_CHUNK_SIZE % RX_PACKET_BYTES) 1 : 0); // have to send +1 if need
+            }
+            next_buffer_index = !next_buffer_index;
+            if (data_buf_full[next_buffer_index]) { // start working with the next buffer immediately without waiting (but there is no difference when plotter has 10kHz nibbles painting freq (2048bytes = 4096nibbles / 10000 ~ 41ms per 2048bytes))
+                continue;
+            }
+        }
+        if (s_finish_requested) {
+            next_buffer_index = 0;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(tick_wait_delay));
     }   
 }
 
@@ -186,9 +286,18 @@ static void send_data_to_plotter_task(void *arg)
 
 static void sub_draw_start_cb(const void * msgin)
 {
+    ESP_LOGI(TAG, ">> Draw start received");
     (void)msgin;
+    if (s_draw_active)
+    {
+        ESP_LOGW(TAG, "DRAW_START when previous session isn't finished; ignoring");
+        return;
+    }
+
     plotter_send_cmd(CMD_DRAW_BEGIN, NULL);
     s_draw_active = true;
+    s_finish_requested = false;
+
     publish_need_packets(PACKETS_NUMBER_FOR_FIRST_REQUEST);
 }
 
@@ -212,6 +321,8 @@ static void executor_task(void *arg)
 static void microros_init_task(void *arg)
 {
     (void)arg;
+    init_mutex();
+
     vTaskDelay(pdMS_TO_TICKS(1000)); // небольшой стартовый лаг сети
 
     allocator = rcl_get_default_allocator();
@@ -244,11 +355,20 @@ static void microros_init_task(void *arg)
         "/plotter/cmd/need_packets",
         &rmw_qos_profile_default));  // reliable
 
+    // --- ИСПРАВЛЕНИЕ: rclc_subscription_init требует 5 аргументов. Задаём явный QoS. ---
+    rmw_qos_profile_t qos_reliable_kl1 = rmw_qos_profile_default;
+    qos_reliable_kl1.reliability = RMW_QOS_POLICY_RELIABILITY_RELIABLE;
+    qos_reliable_kl1.durability  = RMW_QOS_POLICY_DURABILITY_VOLATILE;
+    qos_reliable_kl1.history     = RMW_QOS_POLICY_HISTORY_KEEP_LAST;
+    qos_reliable_kl1.depth       = 1;
+    // ------------------------------------------------------------------------------------
+
     // Subscriber: stream RELIABLE
     RCCHECK(rclc_subscription_init(
         &sub_stream, &node,
         ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, UInt8MultiArray),
-        "/plotter/byte_stream"));
+        "/plotter/byte_stream",
+        &qos_reliable_kl1));
 
     // Control subscribers: draw_start / draw_finish (RELIABLE по умолчанию)
     RCCHECK(rclc_subscription_init_default(
@@ -276,8 +396,8 @@ static void microros_init_task(void *arg)
     RCCHECK(rclc_executor_add_subscription(&executor, &sub_draw_start, &s_msg_empty,   &sub_draw_start_cb, ON_NEW_DATA));
     RCCHECK(rclc_executor_add_subscription(&executor, &sub_draw_finish,&s_msg_empty,   &sub_draw_finish_cb,ON_NEW_DATA));
 
+    xTaskCreatePinnedToCore(send_data_to_plotter_task, "mr_sender", 6144, NULL, 5, &sender_task_handle, 1);
     xTaskCreatePinnedToCore(executor_task,    "mr_executor",  9216, NULL, 6, NULL, 0);
-    xTaskCreatePinnedToCore(send_data_to_plotter_task, "mr_sender", 2048, NULL, 5, &sender_task_handle, 0);
 
     vTaskDelete(NULL);
 }
