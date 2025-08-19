@@ -27,8 +27,8 @@
 #include "esp32_to_stm32.h"
 
 // ===================== DEFINES =======================
-#define PACKETS_NUMBER_FOR_FIRST_REQUEST 5
-#define RX_PACKET_BYTES 480u
+#define PACKETS_NUMBER_FOR_FIRST_REQUEST 1
+#define RX_PACKET_BYTES 2048u
 
 #define RCCHECK(fn) do{ rcl_ret_t rc__ = (fn); if (rc__ != RCL_RET_OK){ \
     ESP_LOGE(TAG, "RCL err %d at %s:%d", (int)rc__, __FILE__, __LINE__); return; } }while(0)
@@ -86,23 +86,17 @@ static uint8_t pending_buf_index = 0xFF;
 
 static void publish_need_packets(uint8_t n){
     s_msg_need.data = n;
-    for (;;)
-    {
-        rcl_ret_t rc = rcl_publish(&pub_need, &s_msg_need, NULL);
-        if (rc == RCL_RET_OK){
-            ESP_LOGI(TAG, "SENDING: need_packets: %u", n);
-            break;
-        } else {
-            ESP_LOGW(TAG, "need_packets publish failed rc=%d", (int)rc);
-        }
-        ESP_LOGW(TAG, ">> Waiting for 20ms and repeat again");
-        vTaskDelay(pdMS_TO_TICKS(20));
+    rcl_ret_t rc = rcl_publish(&pub_need, &s_msg_need, NULL);
+    if (rc == RCL_RET_OK){
+        ESP_LOGI(TAG, "SENDING: need_packets: %u", n);
+    } else {
+        ESP_LOGW(TAG, "need_packets publish failed rc=%d", (int)rc);
     }
 }
 
 static uint32_t stored_data_len = 0;
 static uint32_t out_of_current_buf_len = 0;
-static uint8_t next_filling_buf_index = 0;
+static uint8_t next_filling_buf_index = 1;
 static uint32_t tail_data_len = 0;
 
 static void reset_sub_stream_cb_private_variables() {
@@ -123,37 +117,30 @@ static void sub_stream_cb(const void * msgin)
     const std_msgs__msg__UInt8MultiArray *m = (const std_msgs__msg__UInt8MultiArray*)msgin;
     const uint8_t *incoming_data = m->data.data;
     size_t incoming_data_len = m->data.size;
-
+    static const char PACKETS_RECEIVER_TAG[] = "ROS2 packets receiver";
     if (incoming_data_len == 0){
-        ESP_LOGW(TAG, ">> Recieved len == 0");
+        ESP_LOGW(PACKETS_RECEIVER_TAG, ">> Recieved len == 0");
         return;
     }
     
     if (incoming_data_len != RX_PACKET_BYTES){
-        ESP_LOGW(TAG, ">> Unexpected payload len=%u (expected %u)",
+        ESP_LOGW(PACKETS_RECEIVER_TAG, ">> Unexpected payload len=%u (expected %u)",
                  (unsigned)incoming_data_len, (unsigned)RX_PACKET_BYTES);
     }
 
     if (!s_draw_active) {
-        ESP_LOGW(TAG, "Received data from plotter data publisher when draw_active == FALSE");
+        ESP_LOGW(PACKETS_RECEIVER_TAG, "Received data from plotter data publisher when draw_active == FALSE");
         return;
     }
 
-    // if (s_draw_active && s_finish_requested ) {
-    //     ESP_LOGW(TAG, "Check logic: received data when the "); // maybe wrong logic
-    //     return;
-    // }
-
-// NOTIFY CMD: xTaskNotifyGive(sender_task_handle);
-
     if (data_buf_full[next_filling_buf_index]) { // this receiver should be called only if we have empty buffer; otherwise, this is wrong pipeline:
-        ESP_LOGE("ROS2 packets receiver", "Wrong data pipeline, can't continue: receiving terminated, data dropped");
+        ESP_LOGE(PACKETS_RECEIVER_TAG, "Wrong data pipeline, can't continue: receiving terminated, data dropped. Fullfill state: %u:%u", data_buf_full[0], data_buf_full[1]);
         return;
     }
 
     // check if we have tail in the tail buf:
     if (tail_data_len != 0) { // copy tail to currently filling buf:
-       memcpy(data_buf, data_tail, tail_data_len);
+       memcpy(data_buf[next_filling_buf_index], data_tail, tail_data_len);
        tail_data_len = 0;
     }
 
@@ -184,6 +171,7 @@ static void sub_stream_cb(const void * msgin)
             }
             UNLOCK_DATA_REQUEST_FLAG_CHANGING();
             if (send_request_for_more_data) {
+                ESP_LOGI(PACKETS_RECEIVER_TAG, "Sent new packets request from PACKETS RECEIVER");
                 publish_need_packets((SPI_CHUNK_SIZE - out_of_current_buf_len)/RX_PACKET_BYTES + (out_of_current_buf_len ? 1 : 0));
             }
         }
@@ -203,51 +191,50 @@ static void sub_stream_cb(const void * msgin)
 }
 
 // ===================== DATA SENDER TO PLOTTER =======================
-static void wait_on_task(uint32_t *ticks_count, uint8_t *tag, uint8_t *info_message) {
-    static const uint8_t tick_wait_delay = 5;
+static void wait_on_task(uint32_t *delay_periods_counter, const char *tag, const char *info_message) {
+    static const uint8_t one_period_wait_delay = 5;
     static const uint8_t log_after_s = 5;
-    vTaskDelay(pdMS_TO_TICKS(tick_wait_delay));
-    if (++(*ticks_count) > log_after_s * 1000 / tick_wait_delay) {
-        ESP_LOGW(tag, "%s for more than %ds", info_message, log_after_s);
-        *ticks_count = 0;
+    vTaskDelay(pdMS_TO_TICKS(one_period_wait_delay));
+    if (++(*delay_periods_counter) > log_after_s * 1000 / one_period_wait_delay) {
+        //ESP_LOGW(tag, "%s for more than %ds", info_message, log_after_s);
+        *delay_periods_counter = 0;
     }                
 }
 
 static void send_data_to_plotter_task(void *arg)
 {
     static uint8_t pipeline_is_broken = 0;
-    static uint8_t SENDER_TAG[] = "Plotter packets sender";
+    static const char SENDER_TAG[] = "Plotter packets sender";
 
     if (pipeline_is_broken) {
-        vTaskDelay(2000);
+        vTaskDelay(pdMS_TO_TICKS(2000));
         ESP_LOGE(SENDER_TAG, "Wrong data pipeline, can't continue: sending terminated, data dropped");
     }
 
     ESP_LOGI(SENDER_TAG, ">> send_data_to_plotter_task started");
     (void)arg;
-    
+
     //ulTaskNotifyTake(pdTRUE, 0);
     for(;;){
-
         if (!s_draw_active) {
-            ESP_LOGW(SENDER_TAG, ">> Sender was activated when there is no active drawing");
+            vTaskDelay(pdMS_TO_TICKS(200));
             continue;
         }
 
-        uint32_t ticks_count = 0;
+        uint32_t delay_periods_counter = 0;
         // TODO: make this loop stoppable:
         while (!plotter_is_ready_to_receive_draw_stream_data()) { // just wait when plotter ready
-            wait_on_task(ticks_count, SENDER_TAG, "Waiting for plotter ready");
+            wait_on_task(&delay_periods_counter, SENDER_TAG, "Waiting for plotter ready");
         }
        
         ESP_LOGI(SENDER_TAG, "Plotter ready");
 
         static uint8_t next_buffer_index = 0;
 
-        ticks_count = 0;
+        delay_periods_counter = 0;
         // TODO: make this loop stoppable with timeout:
-        while (!data_buf_full[next_buffer_index])) {
-            wait_on_task(ticks_count, SENDER_TAG, "Waiting for fullfilled buffer ");
+        while (!data_buf_full[next_buffer_index]) {
+            wait_on_task(&delay_periods_counter, SENDER_TAG, "Waiting for fullfilled buffer ");
             if (s_finish_requested) {
                 reset_plotter_streaming_variables();
                 if (data_buf_full[0] || data_buf_full[1]) { // TODO: check logic when both the buffers are not empty
@@ -258,18 +245,20 @@ static void send_data_to_plotter_task(void *arg)
         
         ESP_LOGI(SENDER_TAG, "Plotter ready & have fullfilled buffer index %u, sending data...", next_buffer_index);
         plotter_send_draw_stream_data(data_buf[next_buffer_index], SPI_CHUNK_SIZE);
+        data_buf_full[next_buffer_index] = 0;
         if (!s_finish_requested) {
+            next_buffer_index = !next_buffer_index;
             uint8_t send_request_for_more_data = 0;
             LOCK_DATA_REQUEST_FLAG_CHANGING();
-            if (!data_buf[next_buffer_index]) {
+            if (!data_requested_for_buf[next_buffer_index]) {
                 send_request_for_more_data = 1;
-                data_requested_for_buf[next_filling_buf_index] = 1;
+                data_requested_for_buf[next_buffer_index] = 1;
             }
             UNLOCK_DATA_REQUEST_FLAG_CHANGING();
             if (send_request_for_more_data){
-                publish_need_packets((SPI_CHUNK_SIZE/RX_PACKET_BYTES) + ((SPI_CHUNK_SIZE % RX_PACKET_BYTES) 1 : 0); // have to send +1 if need
+                ESP_LOGI(SENDER_TAG, "Sent new packets request from DATA SENDER");
+                publish_need_packets((SPI_CHUNK_SIZE / RX_PACKET_BYTES) + ((SPI_CHUNK_SIZE % RX_PACKET_BYTES) ? 1 : 0)); // have to send +1 if need
             }
-            next_buffer_index = !next_buffer_index;
             if (data_buf_full[next_buffer_index]) { // start working with the next buffer immediately without waiting (but there is no difference when plotter has 10kHz nibbles painting freq (2048bytes = 4096nibbles / 10000 ~ 41ms per 2048bytes))
                 continue;
             }
@@ -278,7 +267,7 @@ static void send_data_to_plotter_task(void *arg)
             next_buffer_index = 0;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(tick_wait_delay));
+        vTaskDelay(pdMS_TO_TICKS(5));
     }   
 }
 
