@@ -28,7 +28,6 @@
 
 // ===================== DEFINES =======================
 #define PACKETS_NUMBER_FOR_FIRST_REQUEST 1
-#define RX_PACKET_BYTES 2048u
 
 #define RCCHECK(fn) do{ rcl_ret_t rc__ = (fn); if (rc__ != RCL_RET_OK){ \
     ESP_LOGE(TAG, "RCL err %d at %s:%d", (int)rc__, __FILE__, __LINE__); return; } }while(0)
@@ -57,7 +56,6 @@ static volatile bool     s_draw_active       = false;
 static volatile bool     s_finish_requested  = false;
 
 static uint8_t data_buf[2][SPI_CHUNK_SIZE];
-static uint8_t data_tail[RX_PACKET_BYTES];
 static volatile uint8_t data_buf_full[2] = {0, 0};
 static volatile uint8_t data_requested_for_buf[2] = {0, 0};
 static TaskHandle_t sender_task_handle = NULL;
@@ -90,20 +88,25 @@ static void publish_need_packets(uint8_t n){
     if (rc == RCL_RET_OK){
         ESP_LOGI(TAG, "SENDING: need_packets: %u", n);
     } else {
-        ESP_LOGW(TAG, "need_packets publish failed rc=%d", (int)rc);
+        ESP_LOGE(TAG, "need_packets publish failed rc=%d", (int)rc);
+        for (;;)
+        {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            rc = rcl_publish(&pub_need, &s_msg_need, NULL);
+            if (rc != RCL_RET_OK){
+                ESP_LOGE(TAG, "need_packets publish failed rc=%d", (int)rc);
+            }
+            else {
+                break;
+            }
+        }
     }
 }
 
-static uint32_t stored_data_len = 0;
-static uint32_t out_of_current_buf_len = 0;
-static uint8_t next_filling_buf_index = 1;
-static uint32_t tail_data_len = 0;
+static uint8_t next_filling_buf_index = 0;
 
 static void reset_sub_stream_cb_private_variables() {
-    stored_data_len = 0;
-    out_of_current_buf_len = 0;
     next_filling_buf_index = 0;
-    tail_data_len = 0;
 }
 
 static void reset_plotter_streaming_variables() {
@@ -113,7 +116,7 @@ static void reset_plotter_streaming_variables() {
 // ===================== PACKETS RECEIVING CALLBACK =======================
 static void sub_stream_cb(const void * msgin)
 {
-    //ESP_LOGI(TAG, ">> sub_stream_cb entered");
+    ESP_LOGI(TAG, ">> sub_stream_cb entered %u", plotter_get_ready_pins_state());
     const std_msgs__msg__UInt8MultiArray *m = (const std_msgs__msg__UInt8MultiArray*)msgin;
     const uint8_t *incoming_data = m->data.data;
     size_t incoming_data_len = m->data.size;
@@ -123,9 +126,9 @@ static void sub_stream_cb(const void * msgin)
         return;
     }
     
-    if (incoming_data_len != RX_PACKET_BYTES){
+    if (incoming_data_len != SPI_CHUNK_SIZE){
         ESP_LOGW(PACKETS_RECEIVER_TAG, ">> Unexpected payload len=%u (expected %u)",
-                 (unsigned)incoming_data_len, (unsigned)RX_PACKET_BYTES);
+                 (unsigned)incoming_data_len, (unsigned)SPI_CHUNK_SIZE);
     }
 
     if (!s_draw_active) {
@@ -138,55 +141,21 @@ static void sub_stream_cb(const void * msgin)
         return;
     }
 
-    // check if we have tail in the tail buf:
-    if (tail_data_len != 0) { // copy tail to currently filling buf:
-       memcpy(data_buf[next_filling_buf_index], data_tail, tail_data_len);
-       tail_data_len = 0;
-    }
-
-    // check if we need write all the data in current buf:
-    if ((stored_data_len + incoming_data_len) >= SPI_CHUNK_SIZE) {
-        out_of_current_buf_len = stored_data_len + incoming_data_len - SPI_CHUNK_SIZE;
-        memcpy(data_buf[next_filling_buf_index] + stored_data_len, incoming_data, incoming_data_len - out_of_current_buf_len);
-        data_requested_for_buf[next_filling_buf_index] = 0; // it should be safe because we can't sending and filling the buf simultaneously
-        data_buf_full[next_filling_buf_index] = 1;
-        // identify if we have free transfer buffer or we have to store in tail buf:
-        next_filling_buf_index = !next_filling_buf_index; // switch active buffer (should be normal flow)
-        uint8_t store_in_tail_buf = data_buf_full[next_filling_buf_index]; // if the next normal buf is still full, we have to store data tail in tail buf
-        uint8_t *target_buf_for_data_tail = store_in_tail_buf ? data_tail : data_buf[next_filling_buf_index];
-        memcpy(target_buf_for_data_tail, incoming_data + incoming_data_len - out_of_current_buf_len, out_of_current_buf_len);
-
-        if (store_in_tail_buf) {
-            tail_data_len = out_of_current_buf_len;
-        } else {
-            stored_data_len = out_of_current_buf_len;
-        }
-        
-        if (!store_in_tail_buf) {
-            uint8_t send_request_for_more_data = 0;
-            LOCK_DATA_REQUEST_FLAG_CHANGING();
-            if (!data_requested_for_buf[next_filling_buf_index]) {
-                send_request_for_more_data = 1;
-                data_requested_for_buf[next_filling_buf_index] = 1;
-            }
-            UNLOCK_DATA_REQUEST_FLAG_CHANGING();
-            if (send_request_for_more_data) {
-                ESP_LOGI(PACKETS_RECEIVER_TAG, "Sent new packets request from PACKETS RECEIVER");
-                publish_need_packets((SPI_CHUNK_SIZE - out_of_current_buf_len)/RX_PACKET_BYTES + (out_of_current_buf_len ? 1 : 0));
-            }
-        }
-    }
-    else {
-        memcpy(data_buf[next_filling_buf_index] + stored_data_len, incoming_data, incoming_data_len);
-        stored_data_len += incoming_data_len;
-    }
+    memcpy(data_buf[next_filling_buf_index], incoming_data, incoming_data_len);
+    data_requested_for_buf[next_filling_buf_index] = 0; // it should be safe because we can't sending and filling the buf simultaneously
+    data_buf_full[next_filling_buf_index] = 1;
+    next_filling_buf_index = !next_filling_buf_index;
     
-    if (s_draw_active && s_finish_requested) {
-        if (stored_data_len != SPI_CHUNK_SIZE) {
-            memset(data_buf[next_filling_buf_index] + stored_data_len, 0, SPI_CHUNK_SIZE - stored_data_len); // fill with 0 all the data to make the packet eq SPI_CHUNK_SIZE
-        }
-        data_buf_full[next_filling_buf_index] = 1;
-        reset_sub_stream_cb_private_variables();
+    uint8_t send_request_for_more_data = 0;
+    LOCK_DATA_REQUEST_FLAG_CHANGING();
+    if (!data_requested_for_buf[next_filling_buf_index] && !data_buf_full[next_filling_buf_index]) {
+        send_request_for_more_data = 1;
+        data_requested_for_buf[next_filling_buf_index] = 1;
+    }
+    UNLOCK_DATA_REQUEST_FLAG_CHANGING();
+    if (send_request_for_more_data) {
+        ESP_LOGI(PACKETS_RECEIVER_TAG, "Sent new packets request from PACKETS RECEIVER");
+        publish_need_packets(1);
     }
 }
 
@@ -211,7 +180,7 @@ static void send_data_to_plotter_task(void *arg)
         ESP_LOGE(SENDER_TAG, "Wrong data pipeline, can't continue: sending terminated, data dropped");
     }
 
-    ESP_LOGI(SENDER_TAG, ">> send_data_to_plotter_task started");
+    ESP_LOGI(SENDER_TAG, ">> send_data_to_plotter_task started (SPI_CHUNK_SIZE == %d)", SPI_CHUNK_SIZE);
     (void)arg;
 
     //ulTaskNotifyTake(pdTRUE, 0);
@@ -257,7 +226,7 @@ static void send_data_to_plotter_task(void *arg)
             UNLOCK_DATA_REQUEST_FLAG_CHANGING();
             if (send_request_for_more_data){
                 ESP_LOGI(SENDER_TAG, "Sent new packets request from DATA SENDER");
-                publish_need_packets((SPI_CHUNK_SIZE / RX_PACKET_BYTES) + ((SPI_CHUNK_SIZE % RX_PACKET_BYTES) ? 1 : 0)); // have to send +1 if need
+                publish_need_packets(1); // have to send +1 if need
             }
             if (data_buf_full[next_buffer_index]) { // start working with the next buffer immediately without waiting (but there is no difference when plotter has 10kHz nibbles painting freq (2048bytes = 4096nibbles / 10000 ~ 41ms per 2048bytes))
                 continue;
@@ -344,7 +313,6 @@ static void microros_init_task(void *arg)
         "/plotter/cmd/need_packets",
         &rmw_qos_profile_default));  // reliable
 
-    // --- ИСПРАВЛЕНИЕ: rclc_subscription_init требует 5 аргументов. Задаём явный QoS. ---
     rmw_qos_profile_t qos_reliable_kl1 = rmw_qos_profile_default;
     qos_reliable_kl1.reliability = RMW_QOS_POLICY_RELIABILITY_RELIABLE;
     qos_reliable_kl1.durability  = RMW_QOS_POLICY_DURABILITY_VOLATILE;
@@ -371,7 +339,7 @@ static void microros_init_task(void *arg)
         "/plotter/cmd/draw_finish"));
 
     std_msgs__msg__UInt8MultiArray__init(&s_msg_stream);
-    bool ok = rosidl_runtime_c__uint8__Sequence__init(&s_msg_stream.data, RX_PACKET_BYTES);
+    bool ok = rosidl_runtime_c__uint8__Sequence__init(&s_msg_stream.data, SPI_CHUNK_SIZE);
     if (!ok){
         ESP_LOGE(TAG, "Sequence init failed");
         return;
@@ -385,8 +353,8 @@ static void microros_init_task(void *arg)
     RCCHECK(rclc_executor_add_subscription(&executor, &sub_draw_start, &s_msg_empty,   &sub_draw_start_cb, ON_NEW_DATA));
     RCCHECK(rclc_executor_add_subscription(&executor, &sub_draw_finish,&s_msg_empty,   &sub_draw_finish_cb,ON_NEW_DATA));
 
-    xTaskCreatePinnedToCore(send_data_to_plotter_task, "mr_sender", 6144, NULL, 5, &sender_task_handle, 1);
-    xTaskCreatePinnedToCore(executor_task,    "mr_executor",  9216, NULL, 6, NULL, 0);
+    xTaskCreatePinnedToCore(send_data_to_plotter_task, "mr_sender", 2*4096, NULL, 10, NULL, 1);
+    xTaskCreatePinnedToCore(executor_task,    "mr_executor",  8192, NULL, 9, NULL, 0);
 
     vTaskDelete(NULL);
 }
@@ -394,5 +362,5 @@ static void microros_init_task(void *arg)
 // ===== API =====
 void microros_bridge_init()
 {
-    xTaskCreatePinnedToCore(microros_init_task, "mr_init", 16384, NULL, 5, NULL, 0);
+    xTaskCreatePinnedToCore(microros_init_task, "mr_init", 20480, NULL, 5, NULL, 0);
 }

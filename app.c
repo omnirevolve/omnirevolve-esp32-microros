@@ -17,8 +17,7 @@ void appMain(void)
 {
     ESP_LOGI(TAG, "boot");
 
-    ESP_LOGI(TAG, "Initializing plotter hardware...");
-    plotter_init();
+    plotter_init_sync();
     plotter_start_all_tasks();  // UART rx loop, control/heartbeat, keypad
 
     vTaskDelay(pdMS_TO_TICKS(500)); // stab
