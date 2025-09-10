@@ -93,9 +93,10 @@ static void telem_timer_cb(rcl_timer_t *timer, int64_t last_call_time)
   g_msg_telem.y_steps       = (int32_t)ps.y_pos;
   g_msg_telem.is_calibrated = ps.is_calibrated ? true : false;
   g_msg_telem.is_homed      = ps.is_homed ? true : false;
+  g_msg_telem.bytes_processed = ps.bytes_processed;
 
-  printf("timer called with data to send: ps.is_calibrated = %s \n", ps.is_calibrated ? "true" : "false");
 
+  //printf("timer called with data to send: ps.is_calibrated = %s \n", ps.is_calibrated ? "true" : "false");
   (void) rcl_publish(&g_pub_telem, &g_msg_telem, NULL);
 }
 
@@ -113,11 +114,16 @@ static void sub_stream_cb(const void *msgin)
   const std_msgs__msg__UInt8MultiArray *m =
       (const std_msgs__msg__UInt8MultiArray *)msgin;
 
+  bool need_add_zeros = false;
   if (m->data.size < SPI_CHUNK_SIZE) {
-    ESP_LOGW(TAG, "unexpected chunk size: %u (< %u)", (unsigned)m->data.size, (unsigned)SPI_CHUNK_SIZE);
+    ESP_LOGW(TAG, "unexpected chunk size: %u (< %u), added zero data till the size", (unsigned)m->data.size, (unsigned)SPI_CHUNK_SIZE);
+    need_add_zeros = true;
   }
 
   memcpy(s_data_buf[fill_idx], m->data.data, SPI_CHUNK_SIZE);
+  if (need_add_zeros) {
+    memset(s_data_buf[fill_idx] + m->data.size, 0x00, SPI_CHUNK_SIZE - m->data.size);
+  }
   s_data_buf_full[fill_idx] = 1;
   fill_idx ^= 1;
 }
