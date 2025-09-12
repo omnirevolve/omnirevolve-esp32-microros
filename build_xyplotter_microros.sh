@@ -48,12 +48,36 @@ cmd="${1:-}"; [[ -z "$cmd" ]] && usage
 monitor_firmware() {
   echo -e "${GREEN}Starting serial monitor on ${SERIAL_PORT}...${NC}"
   echo -e "${YELLOW}Press Ctrl+] to exit monitor${NC}"
+
+  # 1) Пытаемся использовать IDF monitor (правильно управляет DTR/RTS)
+  if [[ -f "$FW_DIR/esp-idf/export.sh" ]]; then
+    # экспортируем среду ESP-IDF (как делает micro_ros_setup)
+    # shellcheck disable=SC1090
+    source "$FW_DIR/esp-idf/export.sh"
+  elif [[ -f "$FW_DIR/third_party/esp-idf/export.sh" ]]; then
+    # на некоторых конфигурациях IDF лежит так
+    # shellcheck disable=SC1090
+    source "$FW_DIR/third_party/esp-idf/export.sh"
+  fi
+
+  if command -v idf.py >/dev/null 2>&1; then
+    EXTRA_COMPONENT_DIRS="$EXTRA_COMPONENT_DIRS_VALUE" \
+    idf.py -p "${SERIAL_PORT}" -b 115200 monitor && return
+  fi
+
+  # 2) Fallback: дёрнуть DTR/RTS через esptool и открыть miniterm/screen
+  if command -v esptool.py >/dev/null 2>&1; then
+    # Быстрый «double reset»: esptool сам выставит линии правильно
+    esptool.py --chip auto --port "${SERIAL_PORT}" --baud 115200 \
+      --before default_reset --after hard_reset chip_id >/dev/null 2>&1 || true
+  fi
+
   if command -v screen &> /dev/null; then
     screen "${SERIAL_PORT}" 115200
   elif command -v minicom &> /dev/null; then
     minicom -D "${SERIAL_PORT}" -b 115200
   else
-    echo -e "${YELLOW}Using Python serial monitor...${NC}"
+    # у miniterm есть ключи --dtr/--rts, но не во всех версиях
     python3 -m serial.tools.miniterm "${SERIAL_PORT}" 115200
   fi
 }
@@ -95,9 +119,12 @@ case "$cmd" in
     ;;
 
   monitor)
-    monitor_firmware
+    need_app_dir
+    pushd "$WS" >/dev/null
+      monitor_firmware
+    popd >/dev/null
     ;;
-
+    
   clean)
     echo -e "${YELLOW}Cleaning build...${NC}"
     rm -rf "$FW_DIR/build" "$FW_DIR/install" "$FW_DIR/log"
