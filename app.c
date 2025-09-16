@@ -30,7 +30,7 @@
 
 // ---------- utils ----------
 #define TAG "app"
-#define SERVICE_END 0x3F  // EOF в потоковом протоколе
+#define SERVICE_END 0x3F  // EOF in stream protocol
 
 #define RCCHECK(fn)                                                            \
   do {                                                                         \
@@ -49,7 +49,7 @@ static rclc_executor_t g_executor;
 
 static rcl_subscription_t g_sub_stream;      // /plotter/byte_stream (RELIABLE)
 static rcl_subscription_t g_sub_draw_start;  // /plotter/cmd/draw_start
-static rcl_subscription_t g_sub_draw_finish; // /plotter/cmd/draw_finish (не используем, но оставлен подписчиком)
+static rcl_subscription_t g_sub_draw_finish; // /plotter/cmd/draw_finish (not used, but kept as subscriber)
 static rcl_publisher_t   g_pub_need;         // /plotter/cmd/need_packets
 static rcl_subscription_t g_sub_home;        // /plotter/cmd/home
 static rcl_subscription_t g_sub_calibrate;   // /plotter/cmd/calibrate
@@ -70,14 +70,14 @@ static xyplotter_msgs__msg__PlotterTelemetry g_msg_telem;
 // ---------- stream/buffers ----------
 static volatile bool s_draw_active = false;
 
-// двойной буфер и реальные длины каждого чанка
+// double buffer and real lengths of each chunk
 static uint8_t  s_data_buf[2][SPI_CHUNK_SIZE];
 static volatile uint8_t s_data_buf_full[2] = {0, 0};
 
 static TaskHandle_t      s_sender_task = NULL;
 static SemaphoreHandle_t s_need_sem    = NULL;
 
-static volatile bool s_eof_seen = false;   // установлен, как только в ЛЮБОМ принятом чанке обнаружен 0xFF в последнем байте
+static volatile bool s_eof_seen = false;   // set when 0x3F detected in last byte of ANY received chunk
 
 // ---- READY ISR ----
 void IRAM_ATTR ready_isr(void *arg)
@@ -129,7 +129,7 @@ static void sub_stream_cb(const void *msgin)
 
   memcpy(s_data_buf[fill_idx], m->data.data, n);
 
-  // [3] Детект EOF по последнему байту чанка
+  // [3] Detect EOF by last byte of chunk
   if (s_data_buf[fill_idx][n - 1] == (uint8_t)SERVICE_END) {
     s_eof_seen = true;
   }
@@ -146,14 +146,14 @@ static void sub_stream_cb(const void *msgin)
 static void sub_home_cb(const void *msgin)
 {
   (void)msgin;
-  printf("CMD/HOME message received");
+  printf("CMD/HOME message received\n");
   plotter_send_cmd(CMD_HOME, NULL);
 }
 
 static void sub_calibrate_cb(const void *msgin)
 {
   (void)msgin;
-  printf("CMD/CALIBRATE message received");
+  printf("CMD/CALIBRATE message received\n");
   plotter_send_cmd(CMD_CALIBRATE, NULL);
 }
 
@@ -163,27 +163,28 @@ static void sub_draw_start_cb(const void *msgin)
   (void)msgin;
   if (s_draw_active) return;
 
-  // сброс состояния при новом старте
+  // reset state for new start
   s_eof_seen = false;
   s_data_buf_full[0] = s_data_buf_full[1] = 0;
   fill_idx = 0;
 
   plotter_send_cmd(CMD_DRAW_BEGIN, NULL);
   s_draw_active = true;
+  oled_show_message("Drawing...", 2000);
 
-  // триггерим первую порцию пакетов
+  // trigger first batch of packets
   g_msg_need.data = 1;
   (void)rcl_publish(&g_pub_need, &g_msg_need, NULL);
 }
 
-// По новой схеме draw_finish не используем, оставим пустым
+// According to new scheme draw_finish is not used, leave empty
 static void sub_draw_finish_cb(const void *msgin)
 {
   (void)msgin;
-  // Ничего не делаем: ориентируемся на EOF в потоке.
+  // no-op
 }
 
-// ---- sender task: реагирует на READY и шлёт в STM32 ----
+// ---- sender task: reacts to READY and sends to STM32 ----
 static void send_data_to_plotter_task(void *arg)
 {
   (void)arg;
@@ -192,12 +193,12 @@ static void send_data_to_plotter_task(void *arg)
   uint8_t send_idx = 0;
 
   for (;;) {
-    // ждём READY от STM32
+    // wait for READY from STM32
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
     if (!s_draw_active) continue;
 
-    // ждём, пока соответствующий буфер заполнится UI-нодой
+    // wait until corresponding buffer is filled by UI node
     while (!s_data_buf_full[send_idx]) {
       if (!s_draw_active) break;
       vTaskDelay(pdMS_TO_TICKS(1));
@@ -208,13 +209,10 @@ static void send_data_to_plotter_task(void *arg)
     s_data_buf_full[send_idx] = 0;
     send_idx ^= 1;
 
-    // [4] Если EOF уже встречен (в любом ранее принятом чанке),
-    //     больше пакетов НЕ запрашиваем.
+    // Request more until EOF seen
     if (!s_eof_seen) {
       xSemaphoreGive(s_need_sem);
     }
-    // [5] Если EOF уже был и буферов нет — дальнейшие READY просто разбудят таск;
-    //     он вернётся спать до следующего старта (игнор лишних READY).
   }
 }
 
@@ -223,12 +221,10 @@ static void need_pub_timer_cb(rcl_timer_t *timer, int64_t last_call_time)
 {
   (void)timer; (void)last_call_time;
 
-  // публикуем, пока есть «кредиты» от sender task
+  // publish while there are "credits" from sender task
   while (xSemaphoreTake(s_need_sem, 0) == pdTRUE) {
-    // если уже видели EOF — перестаём просить
     if (s_eof_seen) {
-      // сливаем оставшиеся кредиты, не публикуя
-      continue;
+      continue; // stop requesting after EOF
     }
     g_msg_need.data = 1;
     (void)rcl_publish(&g_pub_need, &g_msg_need, NULL);
@@ -240,7 +236,6 @@ static void need_pub_timer_cb(rcl_timer_t *timer, int64_t last_call_time)
 void appMain(void)
 {
   plotter_init_sync(ready_isr);
-  plotter_start_all_tasks(); // UART rx, control/heartbeat, keypad
   vTaskDelay(pdMS_TO_TICKS(200));
 
   g_allocator = rcl_get_default_allocator();
@@ -254,10 +249,16 @@ void appMain(void)
     RCCHECK(rmw_uros_options_set_udp_address(CONFIG_MICRO_ROS_AGENT_IP,
                                              CONFIG_MICRO_ROS_AGENT_PORT,
                                              rmw_opts));
+
+    // Show connecting status on OLED while waiting for agent
+    oled_show_message("Connecting to Agent...", 5000);
+
     while (rmw_uros_ping_agent(300, 1) != RMW_RET_OK) {
       ESP_LOGW(TAG, "micro-ROS agent not available, retry...");
       vTaskDelay(pdMS_TO_TICKS(300));
     }
+
+    oled_show_message("Agent Connected!", 2000);
   }
 #endif
 
@@ -335,6 +336,7 @@ void appMain(void)
   RCCHECK(rclc_executor_add_subscription(&g_executor, &g_sub_calibrate, &g_msg_empty_calibrate, &sub_calibrate_cb, ON_NEW_DATA));
 
   xTaskCreatePinnedToCore(send_data_to_plotter_task, "mr_sender", 4096 * 2, NULL, 7, NULL, 1);
+  plotter_start_all_tasks(); // UART rx, control/heartbeat, keypad, OLED
 
   for (;;) {
     rclc_executor_spin_some(&g_executor, RCL_MS_TO_NS(10));
