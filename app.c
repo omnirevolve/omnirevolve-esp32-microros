@@ -170,7 +170,6 @@ static void sub_draw_start_cb(const void *msgin)
 
   plotter_send_cmd(CMD_DRAW_BEGIN, NULL);
   s_draw_active = true;
-  oled_show_message("Drawing...", 2000);
 
   // trigger first batch of packets
   g_msg_need.data = 1;
@@ -251,14 +250,14 @@ void appMain(void)
                                              rmw_opts));
 
     // Show connecting status on OLED while waiting for agent
-    oled_show_message("Connecting to Agent...", 5000);
+    //oled_show_message("Connecting to Agent...", 5000);
 
     while (rmw_uros_ping_agent(300, 1) != RMW_RET_OK) {
       ESP_LOGW(TAG, "micro-ROS agent not available, retry...");
       vTaskDelay(pdMS_TO_TICKS(300));
     }
 
-    oled_show_message("Agent Connected!", 2000);
+    //oled_show_message("Agent Connected!", 2000);
   }
 #endif
 
