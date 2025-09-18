@@ -3,7 +3,7 @@ set -eo pipefail   # без -u: setup.bash может ссылаться на un
 
 # --- настройки ---
 WS="${WS:-$HOME/ros2_ws}"
-APP="xyplotter_microros"               # имя каталога в firmware/freertos_apps/apps/
+APP="omnirevolve_esp32_microros"               # имя каталога в firmware/freertos_apps/apps/
 FW_DIR="$WS/firmware"
 APP_DIR="$FW_DIR/freertos_apps/apps/$APP"
 
@@ -34,7 +34,7 @@ need_app_dir() {
 }
 
 # Пути IDF-компонентов, которые должны попасть в сборку
-EXTRA_COMPONENT_DIRS_VALUE="${APP_DIR}/xyplotter_esp32/lib;${APP_DIR}/xyplotter_esp32/components/micro_ros_espidf_component;${APP_DIR}/xyplotter_esp32/components/u8g2"
+EXTRA_COMPONENT_DIRS_VALUE="${APP_DIR}/omnirevolve_esp32_microros/components/micro_ros_espidf_component;${APP_DIR}/omnirevolve_esp32_microros/components/u8g2"
 
 # 1) окружение ROS 2
 if [[ -f "$WS/install/setup.bash" ]]; then
