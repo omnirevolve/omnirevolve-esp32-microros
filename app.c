@@ -17,7 +17,7 @@
 #include <std_msgs/msg/empty.h>
 #include <std_msgs/msg/u_int8.h>
 #include <std_msgs/msg/u_int8_multi_array.h>
-#include <xyplotter_msgs/msg/plotter_telemetry.h>
+#include <omnirevolve_ros2_messages/msg/plotter_telemetry.h>
 #include <rosidl_runtime_c/primitives_sequence_functions.h>
 #include <rmw/qos_profiles.h>
 
