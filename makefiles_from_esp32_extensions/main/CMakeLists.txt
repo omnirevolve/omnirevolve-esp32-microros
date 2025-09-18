@@ -1,15 +1,27 @@
-file(GLOB SRCS ${UROS_APP_FOLDER}/*.c*)
-idf_component_register(SRCS main.c microros_transports.c ${SRCS}
-                       INCLUDE_DIRS ".")
-
-set(U8G2_DIR ${UROS_APP_FOLDER}/components/u8g2)
-
-file(GLOB U8G2_CSRC
-     ${U8G2_DIR}/csrc/*.c
+file(GLOB SRCS
+    ${UROS_APP_FOLDER}/*.c*
+    "${UROS_APP_FOLDER}/components/omnirevolve_esp32_core/components/omnirevolve_core/src/esp32_core.c"
+    "${UROS_APP_FOLDER}/components/omnirevolve_esp32_core/components/omnirevolve_core/src/drivers/*.c"
+    "${UROS_APP_FOLDER}/components/omnirevolve_esp32_core/components/omnirevolve_core/src/link/*.c"
+    "${UROS_APP_FOLDER}/components/omnirevolve_esp32_core/components/u8g2/csrc/u8g2_*.c"
+    "${UROS_APP_FOLDER}/components/omnirevolve_esp32_core/components/u8g2/csrc/u8x8_setup.c"
+    "${UROS_APP_FOLDER}/components/omnirevolve_esp32_core/components/u8g2/csrc/u8x8_8x8.c"
+    "${UROS_APP_FOLDER}/components/omnirevolve_esp32_core/components/u8g2/csrc/u8x8_display.c"
+    "${UROS_APP_FOLDER}/components/omnirevolve_esp32_core/components/u8g2/csrc/u8x8_cad.c"
+    "${UROS_APP_FOLDER}/components/omnirevolve_esp32_core/components/u8g2/csrc/u8x8_byte.c"
+    "${UROS_APP_FOLDER}/components/omnirevolve_esp32_core/components/u8g2/csrc/u8x8_gpio.c"
+    "${UROS_APP_FOLDER}/components/omnirevolve_esp32_core/components/u8g2/csrc/u8x8_fonts.c"
+    "${UROS_APP_FOLDER}/components/omnirevolve_esp32_core/components/u8g2/csrc/u8x8_input_value.c"
+    "${UROS_APP_FOLDER}/components/omnirevolve_esp32_core/components/u8g2/csrc/u8x8_message.c"
+    "${UROS_APP_FOLDER}/components/omnirevolve_esp32_core/components/u8g2/csrc/u8x8_selection_list.c"
+    "${UROS_APP_FOLDER}/components/omnirevolve_esp32_core/components/u8g2/csrc/u8x8_string.c"
+    "${UROS_APP_FOLDER}/components/omnirevolve_esp32_core/components/u8g2/csrc/u8x8_capture.c"
+    "${UROS_APP_FOLDER}/components/omnirevolve_esp32_core/components/u8g2/csrc/u8log*.c"
+    "${UROS_APP_FOLDER}/components/omnirevolve_esp32_core/components/u8g2/csrc/u8x8_d_ssd1309.c"
 )
 
-target_sources(${COMPONENT_LIB} PRIVATE ${U8G2_CSRC})
-target_include_directories(${COMPONENT_LIB} PUBLIC ${U8G2_DIR}/csrc)
+idf_component_register(SRCS main.c microros_transports.c ${SRCS}
+                       INCLUDE_DIRS ".")
 
 set(EXTENSIONS_DIR ${COMPONENT_DIR}/..)
 set(UROS_DIR       ${COMPONENT_DIR}/../../../mcu_ws)
@@ -70,5 +82,10 @@ set_directory_properties( PROPERTIES ADDITIONAL_MAKE_CLEAN_FILES
     "${UROS_DIR}/install;${UROS_DIR}/build;${UROS_DIR}/log" )
 
 add_dependencies(${COMPONENT_LIB} microros)
-target_include_directories(${COMPONENT_LIB} PUBLIC microros)
+target_include_directories(${COMPONENT_LIB} PUBLIC
+        microros
+        "${UROS_APP_FOLDER}/components/omnirevolve_esp32_core/components/omnirevolve_protocol/include"
+        "${UROS_APP_FOLDER}/components/omnirevolve_esp32_core/components/u8g2/csrc"
+        "${UROS_APP_FOLDER}/components/omnirevolve_esp32_core/components/omnirevolve_core/include")
+
 target_link_libraries(${COMPONENT_LIB} PUBLIC microros)

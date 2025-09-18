@@ -25,8 +25,10 @@
 #include <rmw_microros/rmw_microros.h>
 #endif
 
-#include "esp32_to_stm32.h"
-#include "shared/cmd_ids.h" // SPI_CHUNK_SIZE, CMD ids
+//#include "components/omnirevolve_esp32_core/components/omnirevolve_core/include/omnirevolve/esp32_core/esp32_core.h"
+//#include "components/omnirevolve_esp32_core/components/omnirevolve_protocol/include/omnirevolve/protocol/cmd_ids.h"
+#include "omnirevolve/esp32_core/esp32_core.h"
+#include "omnirevolve/protocol/cmd_ids.h"
 
 // ---------- utils ----------
 #define TAG "app"
@@ -65,7 +67,7 @@ static std_msgs__msg__Empty g_msg_empty_calibrate;
 
 static rcl_publisher_t g_pub_telem; // /plotter/telemetry
 static rcl_timer_t g_telem_timer;   // 1000 ms
-static xyplotter_msgs__msg__PlotterTelemetry g_msg_telem;
+static omnirevolve_ros2_messages__msg__PlotterTelemetry g_msg_telem;
 
 // ---------- stream/buffers ----------
 static volatile bool s_draw_active = false;
@@ -273,10 +275,10 @@ void appMain(void)
 
   RCCHECK(rclc_publisher_init(
       &g_pub_telem, &g_node,
-      ROSIDL_GET_MSG_TYPE_SUPPORT(xyplotter_msgs, msg, PlotterTelemetry),
+      ROSIDL_GET_MSG_TYPE_SUPPORT(omnirevolve_ros2_messages, msg, PlotterTelemetry),
       "/plotter/telemetry", &qos_telem));
 
-  xyplotter_msgs__msg__PlotterTelemetry__init(&g_msg_telem);
+  omnirevolve_ros2_messages__msg__PlotterTelemetry__init(&g_msg_telem);
 
   RCCHECK(rclc_timer_init_default(&g_telem_timer, &g_support,
                                   RCL_MS_TO_NS(1000), telem_timer_cb));

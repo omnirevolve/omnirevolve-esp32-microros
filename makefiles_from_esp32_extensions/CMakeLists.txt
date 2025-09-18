@@ -1,5 +1,4 @@
 cmake_minimum_required(VERSION 3.5)
-cmake_minimum_required(VERSION 3.5)
 
 if(NOT DEFINED IDF_PATH)
     message(FATAL_ERROR "The CMake varible IDF_PATH was not set!")
