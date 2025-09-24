@@ -115,6 +115,8 @@ static void sub_stream_cb(const void *msgin)
 {
   if (!s_draw_active) return;
 
+  printf("sub_stream_cb called\n");
+
   if (s_data_buf_full[fill_idx]) {
     ESP_LOGW(TAG, "stream overflow, dropping chunk into buf %u", fill_idx);
     return;
@@ -125,6 +127,7 @@ static void sub_stream_cb(const void *msgin)
 
   uint16_t n = (uint16_t)((m->data.size > SPI_CHUNK_SIZE) ? SPI_CHUNK_SIZE
                                                           : m->data.size);
+  printf("data size is %u \n", n);
   if (n == 0) {
     return;
   }
@@ -192,17 +195,18 @@ static void send_data_to_plotter_task(void *arg)
   s_sender_task = xTaskGetCurrentTaskHandle();
 
   uint8_t send_idx = 0;
+  printf("send_data_to_plotter_task started\n");
 
   for (;;) {
     // wait for READY from STM32
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
+    printf(">> ready signal detected\n");
     if (!s_draw_active) continue;
 
     // wait until corresponding buffer is filled by UI node
     while (!s_data_buf_full[send_idx]) {
       if (!s_draw_active) break;
-      vTaskDelay(pdMS_TO_TICKS(1));
+      vTaskDelay(1);
     }
     if (!s_draw_active) continue;
 
@@ -236,9 +240,6 @@ static void need_pub_timer_cb(rcl_timer_t *timer, int64_t last_call_time)
 // ---------- main ----------
 void appMain(void)
 {
-  plotter_init_sync(ready_isr);
-  vTaskDelay(pdMS_TO_TICKS(200));
-
   g_allocator = rcl_get_default_allocator();
 
   rcl_init_options_t init_opts = rcl_get_zero_initialized_init_options();
@@ -335,6 +336,9 @@ void appMain(void)
   RCCHECK(rclc_executor_add_subscription(&g_executor, &g_sub_draw_finish, &g_msg_empty_finish, &sub_draw_finish_cb, ON_NEW_DATA));
   RCCHECK(rclc_executor_add_subscription(&g_executor, &g_sub_home, &g_msg_empty_home, &sub_home_cb, ON_NEW_DATA));
   RCCHECK(rclc_executor_add_subscription(&g_executor, &g_sub_calibrate, &g_msg_empty_calibrate, &sub_calibrate_cb, ON_NEW_DATA));
+
+  plotter_init_sync(ready_isr);
+  vTaskDelay(pdMS_TO_TICKS(200));
 
   xTaskCreatePinnedToCore(send_data_to_plotter_task, "mr_sender", 4096 * 2, NULL, 7, NULL, 1);
   plotter_start_all_tasks(); // UART rx, control/heartbeat, keypad, OLED
