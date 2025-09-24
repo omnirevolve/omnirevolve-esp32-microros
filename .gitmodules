@@ -1,3 +1,5 @@
 [submodule "components/omnirevolve_esp32_core"]
 	path = components/omnirevolve_esp32_core
 	url = git@github.com:IvanNekrasov/omnirevolve-esp32-core.git
+[submodule "omnirevolve-esp32-core"]
+	url = https://github.com/omnirevolve/omnirevolve-esp32-core.git
