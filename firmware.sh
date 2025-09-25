@@ -1,38 +1,62 @@
 #!/usr/bin/env bash
+# micro-ROS ESP32 firmware helper
+# Commands: prepare | configure | build | flash | monitor | menuconfig | clean
+
 set -eo pipefail   # not using -u: some setup.bash read unset vars
 
-# --- settings ---
+# -------------------- defaults --------------------
 WS="${WS:-$HOME/ros2_ws}"
-APP="omnirevolve_esp32_microros"                             # dir under firmware/freertos_apps/apps/
+APP="omnirevolve_esp32_microros"                               # app dir under firmware/freertos_apps/apps/
 FW_DIR="$WS/firmware"
 APP_DIR="$FW_DIR/freertos_apps/apps/$APP"
 FW_EXT="$FW_DIR/freertos_apps/microros_esp32_extensions"
 
-# host ROS ws messages pkg (source) and where to link it inside mcu_ws
+# host ROS 2 workspace messages pkg (source) and where to symlink it inside mcu_ws
 LINK_SRC="$WS/src/omnirevolve_ros2_messages"
-LINK_DST="$FW_DIR/mcu_ws/ros2/omnirevolve_ros2_messages"     # correct place for micro-ROS mcu_ws
+LINK_DST="$FW_DIR/mcu_ws/ros2/omnirevolve_ros2_messages"       # micro-ROS mcu_ws location
 
-# micro-ROS transport/config
+# micro-ROS transport / serial defaults
 AGENT_IP="${AGENT_IP:-192.168.1.23}"
 AGENT_PORT="${AGENT_PORT:-8888}"
 SERIAL_PORT="${SERIAL_PORT:-/dev/ttyUSB0}"
 
+# extra component dirs for ESP-IDF build (resolved inside firmware ws)
 EXTRA_COMPONENT_DIRS_VALUE="${APP_DIR}/omnirevolve_esp32_microros/components/omnirevolve_esp32_core/components/omnirevolve_core;${APP_DIR}/omnirevolve_esp32_microros/components/omnirevolve_esp32_core/components/omnirevolve_protocol;${APP_DIR}/omnirevolve_esp32_microros/components/omnirevolve_esp32_core/components/u8g2"
 
+# colors
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 
+# -------------------- usage --------------------
 usage() {
-  echo "Usage: $0 {prepare|configure|build|flash|monitor|menuconfig|clean}"
-  echo
-  echo "Env vars:"
-  echo "  WS           workspace path (default: \$HOME/ros2_ws)"
-  echo "  AGENT_IP     micro-ROS agent IP (default: 192.168.1.23)"
-  echo "  AGENT_PORT   micro-ROS agent port (default: 8888)"
-  echo "  SERIAL_PORT  serial port for flash/monitor (default: /dev/ttyUSB0)"
-  exit 1
+  cat <<EOF
+Usage:
+  $(basename "$0") [global options] <command>
+
+Commands:
+  prepare       Create micro-ROS firmware workspace
+  configure     Configure the app transport (uses agent ip/port)
+  build         Build firmware
+  flash         Flash firmware
+  monitor       Open serial monitor
+  menuconfig    Open ESP-IDF menuconfig
+  clean         Remove firmware build artifacts
+
+Global options:
+  --ws PATH             ROS 2 workspace path (default: ${WS})
+  --agent-ip IP         micro-ROS agent IP (default: ${AGENT_IP})
+  --agent-port PORT     micro-ROS agent port (default: ${AGENT_PORT})
+  --serial PATH         Serial port (default: ${SERIAL_PORT})
+  -h, --help            Show this help
+
+Examples:
+  $(basename "$0") --agent-ip 10.0.0.5 configure
+  $(basename "$0") --ws ~/ros2_ws --serial /dev/ttyUSB1 build
+  $(basename "$0") monitor
+EOF
 }
 
-safe_source() { # tolerant source for setup.bash
+# tolerant source for setup files
+safe_source() {
   [ -f "$1" ] || { echo -e "${RED}ERROR:${NC} file not found: $1"; exit 1; }
   export AMENT_TRACE_SETUP_FILES="${AMENT_TRACE_SETUP_FILES:-}"
   # shellcheck disable=SC1090
@@ -66,17 +90,6 @@ ensure_messages_link() {
   local META="$APP_DIR/app-colcon.meta"
   if [[ -f "$META" ]] && ! grep -q '"omnirevolve_ros2_messages"' "$META"; then
     echo -e "${YELLOW}NOTE:${NC} consider adding \"omnirevolve_ros2_messages\" to $META (names section)."
-  fi
-}
-
-ensure_ros_env() {
-  if [[ -f "$WS/install/setup.bash" ]]; then
-    safe_source "$WS/install/setup.bash"
-  elif [[ -f "/opt/ros/humble/setup.bash" ]]; then
-    safe_source "/opt/ros/humble/setup.bash"
-  else
-    echo -e "${RED}ERROR:${NC} ROS 2 environment not found. Install ROS Humble or build your ws."
-    exit 4
   fi
 }
 
@@ -129,8 +142,32 @@ monitor_firmware() {
   fi
 }
 
-cmd="${1:-}"; [[ -z "$cmd" ]] && usage
+# -------------------- parse global options + command --------------------
+cmd=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --ws)             WS="$2"; shift 2;;
+    --agent-ip)       AGENT_IP="$2"; shift 2;;
+    --agent-port)     AGENT_PORT="$2"; shift 2;;
+    --serial|--serial-port) SERIAL_PORT="$2"; shift 2;;
+    -h|--help)        usage; exit 0;;
+    prepare|configure|build|flash|monitor|menuconfig|clean)
+      cmd="$1"; shift; break;;
+    *)
+      echo "Unknown option or command: $1"; usage; exit 1;;
+  esac
+done
 
+[[ -z "$cmd" ]] && { usage; exit 1; }
+
+# recompute paths that depend on WS after flags
+FW_DIR="$WS/firmware"
+APP_DIR="$FW_DIR/freertos_apps/apps/$APP"
+FW_EXT="$FW_DIR/freertos_apps/microros_esp32_extensions"
+LINK_SRC="$WS/src/omnirevolve_ros2_messages"
+LINK_DST="$FW_DIR/mcu_ws/ros2/omnirevolve_ros2_messages"
+
+# -------------------- commands --------------------
 case "$cmd" in
   prepare)
     mkdir -p "$FW_DIR"
